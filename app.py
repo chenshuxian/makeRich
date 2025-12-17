@@ -200,7 +200,7 @@ if run_btn:
     elif not selected_strats: st.error("請至少選擇一個策略！")
     else:
         cmd = [
-            "sys.executable", "tw_scanner_pro_final.py",
+            sys.executable, "tw_scanner_pro_final.py",
             "--tickers-file", ticker_path,
             "--strategies", *selected_strats,
             "--min-volume", str(min_volume),
