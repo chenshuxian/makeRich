@@ -221,51 +221,24 @@ if run_btn:
         status_text.info("🚀 掃描器啟動中...")
         
         try:
-            # 修改點 1: 使用 Popen 並且同時監聽 stdout (正常輸出) 和 stderr (錯誤輸出)
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,  # 這裡一定要抓 stderr
-                text=True, 
-                encoding="utf-8"
-            )
-            
-            # 修改點 2: 即時讀取輸出
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             while True:
-                # 讀取正常輸出
-                output_line = process.stdout.readline()
-                # 讀取錯誤輸出 (如果有)
-                error_line = process.stderr.readline()
-
-                if output_line == '' and error_line == '' and process.poll() is not None:
-                    break
-                
-                if output_line:
-                    print(output_line.strip()) # 印到 Manage app 日誌
-                    if "Running strategy" in output_line:
-                        status_text.text(f"▶️ {output_line.strip()}")
+                line = process.stdout.readline()
+                if not line and process.poll() is not None: break
+                if line:
+                    if "Running strategy" in line:
+                        status_text.text(f"▶️ {line.strip()}")
                         progress_bar.progress(30)
-                    elif "Plotting" in output_line:
+                    elif "Building intraday" in line:
+                        status_text.text(f"⏳ {line.strip()}")
+                        progress_bar.progress(10)
+                    elif "Plotting" in line:
                         progress_bar.progress(70)
-
-                # --- 關鍵修正：如果有錯誤訊息，直接印在畫面上 ---
-                if error_line:
-                    print(f"ERROR: {error_line.strip()}") # 印到日誌
-                    st.error(f"掃描器報錯: {error_line.strip()}") # 印到網頁上讓你看見
-
-            # 等待程序完全結束
-            return_code = process.wait()
-            
-            if return_code != 0:
-                st.error("❌ 掃描器異常終止，請查看上方錯誤訊息。")
-            else:
-                progress_bar.progress(100)
-                time.sleep(1)
-                status_text.success("✅ 掃描完成！")
-                st.session_state.latest_run_dir = find_latest_run_dir()
-                
-        except Exception as e:
-            st.error(f"執行發生系統錯誤: {e}")
+            progress_bar.progress(100)
+            time.sleep(1)
+            status_text.success("✅ 掃描完成！")
+            st.session_state.latest_run_dir = find_latest_run_dir()
+        except Exception as e: st.error(f"執行發生錯誤: {e}")
 
 # === 結果渲染 ===
 if st.session_state.latest_run_dir:
