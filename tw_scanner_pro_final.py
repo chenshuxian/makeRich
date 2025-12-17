@@ -477,5 +477,7 @@ def main():
                 df = download_history(sym, args.days, args.interval)
                 if not df.empty: plot_universal_chart(df, r["code"], r["name"], r.get("category",""), r.get("group",""), tdir, f"Score{r['total_score']}_{r['strategies']}")
 
+        print(f"__OUTPUT_PATH__:{outdir}") 
+
 if __name__ == "__main__":
     main()

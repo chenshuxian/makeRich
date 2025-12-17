@@ -59,51 +59,77 @@ def get_image_html(file_path, link_url, width="100%"):
 
 def display_chart_gallery(image_paths, gallery_key):
     """
-    通用圖表畫廊函式：處理分頁、排版與連結
-    gallery_key: 用於區分不同 Tabs 的 widget key
+    通用圖表畫廊函式：改用 Button 翻頁並透過 session_state 記憶頁碼
     """
     if not image_paths:
         st.info("沒有圖表可顯示。")
         return
 
-    # --- 控制列：分頁設定 ---
-    c1, c2, c3 = st.columns([1, 2, 4])
+    # 1. 初始化 Session State (記憶頁碼)
+    # 我們用 gallery_key 來區分不同分頁 (例如 top_picks vs strat_xxx) 的頁碼
+    state_key = f"page_idx_{gallery_key}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = 1
+
+    # 2. 控制列：選擇每頁張數
+    c1, c2 = st.columns([2, 6])
     with c1:
-        # 選擇每頁顯示張數
         items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
-    
-    # 計算分頁
+
+    # 計算總頁數
     total_images = len(image_paths)
     total_pages = (total_images + items_per_page - 1) // items_per_page
     
-    with c2:
-        # 頁碼選擇器
-        current_page = st.number_input(
-            f"頁碼 (共 {total_pages} 頁)", min_value=1, max_value=total_pages, value=1, key=f"pg_{gallery_key}"
+    # 防呆：如果切換每頁張數導致當前頁碼超過總頁數，重置為第1頁
+    if st.session_state[state_key] > total_pages:
+        st.session_state[state_key] = 1
+
+    # 3. 翻頁按鈕區 (上一頁 / 頁碼資訊 / 下一頁)
+    col_prev, col_info, col_next = st.columns([1, 2, 1])
+
+    with col_prev:
+        # 如果在第1頁，禁用上一頁按鈕
+        disable_prev = (st.session_state[state_key] <= 1)
+        if st.button("⬅️ 上一頁", key=f"prev_{gallery_key}", disabled=disable_prev, use_container_width=True):
+            st.session_state[state_key] -= 1
+            st.rerun()
+
+    with col_next:
+        # 如果在最後一頁，禁用下一頁按鈕
+        disable_next = (st.session_state[state_key] >= total_pages)
+        if st.button("下一頁 ➡️", key=f"next_{gallery_key}", disabled=disable_next, use_container_width=True):
+            st.session_state[state_key] += 1
+            st.rerun()
+
+    with col_info:
+        # 居中顯示頁碼資訊
+        st.markdown(
+            f"<div style='text-align: center; line-height: 38px; font-weight: bold;'>"
+            f"第 {st.session_state[state_key]} 頁 / 共 {total_pages} 頁"
+            f"</div>", 
+            unsafe_allow_html=True
         )
 
-    # --- 圖片切片與顯示 ---
+    # 4. 圖片切片與顯示
+    current_page = st.session_state[state_key]
     start_idx = (current_page - 1) * items_per_page
     end_idx = start_idx + items_per_page
     current_batch = image_paths[start_idx:end_idx]
 
-    # 設定 Grid：如果選4張就用2欄(大圖)，選8張就用4欄(中圖)
+    # 設定 Grid：4張圖用2欄(大)，8張圖用4欄(中)
     cols_count = 2 if items_per_page == 4 else 4
     cols = st.columns(cols_count)
 
     for idx, img_path in enumerate(current_batch):
         file_name = os.path.basename(img_path)
-        # 解析檔名取得代號 (假設格式: 2330_台積電_...)
         try:
             stock_code = file_name.split("_")[0]
         except:
-            stock_code = "0000" # fallback
+            stock_code = "0000"
         
-        # 產生玩股網連結
         wantgoo_url = f"https://www.wantgoo.com/stock/{stock_code}/technical-chart"
 
         with cols[idx % cols_count]:
-            # 使用 HTML 渲染圖片連結
             st.markdown(get_image_html(img_path, wantgoo_url), unsafe_allow_html=True)
             st.caption(f"📄 {file_name}")
 
@@ -199,8 +225,9 @@ if run_btn:
     if not ticker_path: st.error("請先提供股票清單！")
     elif not selected_strats: st.error("請至少選擇一個策略！")
     else:
+        # [修改] 加入 "-u" 參數以強制不快取輸出 (即時顯示用)
         cmd = [
-            sys.executable, "tw_scanner_pro_final.py",
+            sys.executable, "-u", "tw_scanner_pro_final.py",
             "--tickers-file", ticker_path,
             "--strategies", *selected_strats,
             "--min-volume", str(min_volume),
@@ -216,29 +243,70 @@ if run_btn:
         if "ma_entangle" in selected_strats: cmd.extend(["--ma-entangle-pct", str(ma_entangle_pct)])
         cmd.extend(["--vol-ratio", str(vol_ratio), "--oh-vol-ratio", str(vol_ratio)])
 
+        # === 進度條與終端機 UI 設置 ===
         status_text = st.empty()
-        progress_bar = st.progress(0)
-        status_text.info("🚀 掃描器啟動中...")
+        progress_bar = st.progress(0, text="初始化中...")
+        
+        # 增加即時 Log 顯示區 (Expander)
+        log_expander = st.expander("🖥️ 即時終端機 (Live Logs)", expanded=True)
+        with log_expander:
+            log_container = st.empty()
+        
+        logs = []
         
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            # [修改] bufsize=1 代表行緩衝，stderr=subprocess.STDOUT 代表把錯誤也顯示在 log
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                bufsize=1,
+                encoding="utf-8"
+            )
+            
+            total_tasks = len(selected_strats) + 1 # 策略數 + 初始化/收尾
+            tasks_done = 0
+            
             while True:
                 line = process.stdout.readline()
-                if not line and process.poll() is not None: break
+                if not line and process.poll() is not None: 
+                    break
+                
                 if line:
-                    if "Running strategy" in line:
-                        status_text.text(f"▶️ {line.strip()}")
-                        progress_bar.progress(30)
-                    elif "Building intraday" in line:
-                        status_text.text(f"⏳ {line.strip()}")
-                        progress_bar.progress(10)
-                    elif "Plotting" in line:
-                        progress_bar.progress(70)
-            progress_bar.progress(100)
-            time.sleep(1)
-            status_text.success("✅ 掃描完成！")
-            st.session_state.latest_run_dir = find_latest_run_dir()
-        except Exception as e: st.error(f"執行發生錯誤: {e}")
+                    clean_line = line.strip()
+                    logs.append(clean_line)
+                    # 只顯示最後 10 行避免太長
+                    log_container.code("\n".join(logs[-10:]), language="bash")
+                    
+                    # 簡單的進度判斷邏輯
+                    if "Running:" in clean_line or "Running strategy" in clean_line:
+                        strat_name = clean_line.split(":")[-1].strip()
+                        status_text.info(f"▶️ 正在執行策略: {strat_name}...")
+                        tasks_done += 1
+                        # 計算百分比
+                        pct = int((tasks_done / total_tasks) * 100)
+                        progress_bar.progress(min(pct, 95), text=f"執行中: {strat_name}")
+                    
+                    elif "Building intraday" in clean_line:
+                        status_text.warning("⏳ 正在抓取盤中即時數據...")
+                        
+            
+            # 等待進程完全結束
+            rc = process.poll()
+            
+            if rc == 0:
+                progress_bar.progress(100, text="✅ 掃描完成")
+                status_text.success("✅ 任務全部完成！")
+                time.sleep(1) # 給一點時間寫入檔案
+                st.session_state.latest_run_dir = find_latest_run_dir()
+                st.rerun() # 重新整理以顯示結果
+            else:
+                status_text.error("❌ 掃描異常終止")
+                st.error("掃描器回傳錯誤代碼，請檢查 Log。")
+
+        except Exception as e: 
+            st.error(f"執行發生系統錯誤: {e}")
 
 # === 結果渲染 ===
 if st.session_state.latest_run_dir:
@@ -256,18 +324,9 @@ if st.session_state.latest_run_dir:
         c2.metric("滿分飆股 (Score>=2)", len(df_res[df_res['total_score'] >= 2]))
         c3.metric("最高得分", df_res['total_score'].max() if not df_res.empty else 0)
         
-        tab1, tab2, tab3 = st.tabs(["🏆 總分排行榜", "🖼️ 精選圖表 (Top Picks)", "📂 策略明細"])
-        
-        with tab1:
-            st.markdown("#### 綜合評分表")
-            def highlight_high_score(val): return f'background-color: #4CAF50' if val >= 2 else ''
-            st.dataframe(
-                df_res.style.map(highlight_high_score, subset=['total_score']),
-                use_container_width=True,
-                column_config={"chart_path": st.column_config.LinkColumn("圖表連結"), "vol": st.column_config.NumberColumn("成交量", format="%d")}
-            )
+        tab1, tab2 = st.tabs([ "🖼️ 精選圖表 (Top Picks)", "📂 策略明細"])
 
-        with tab2:
+        with tab1:
             top_chart_dir = os.path.join(run_dir, "charts_intersection_top")
             if os.path.exists(top_chart_dir):
                 images = glob.glob(os.path.join(top_chart_dir, "*.png"))
@@ -277,14 +336,11 @@ if st.session_state.latest_run_dir:
             else:
                 st.warning("本次掃描沒有產生高分股 (Score >= 2) 的圖表。")
 
-        with tab3:
+        with tab2:
             strat_files = glob.glob(os.path.join(run_dir, "*.csv"))
             selected_csv = st.selectbox("選擇策略結果", [f for f in strat_files if "intersection" not in f])
             
             if selected_csv:
-                df_strat = pd.read_csv(selected_csv)
-                st.dataframe(df_strat, use_container_width=True)
-                
                 strat_name = os.path.basename(selected_csv).replace(".csv", "")
                 strat_chart_dir = os.path.join(run_dir, f"charts_{strat_name}")
                 
