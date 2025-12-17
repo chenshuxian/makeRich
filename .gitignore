@@ -1,0 +1,8 @@
+# Ignore everything
+*
+# But not these files
+!app.py
+!tw_scanner_pro_final.py
+!tickers.csv
+!requirements.txt
+!.gitignore
