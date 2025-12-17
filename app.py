@@ -116,7 +116,7 @@ with st.sidebar:
     
     # --- A. 資料來源 ---
     st.header("1. 資料來源")
-    ticker_file = "tickers_grouped.csv"
+    ticker_file = "tickers.csv"
     uploaded_file = st.file_uploader("上傳股票清單 (CSV)", type=["csv"])
     
     if uploaded_file:
