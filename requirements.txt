@@ -7,3 +7,5 @@ requests
 lxml
 html5lib
 openpyxl
+gspread 
+oauth2client

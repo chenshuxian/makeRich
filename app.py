@@ -6,9 +6,17 @@ import subprocess
 import glob
 import time
 import base64
+import gspread
+import yfinance as yf
+import mplfinance as mpf
+import matplotlib
 from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
 
-# === 1. 頁面設定 (Page Configuration) ===
+# 設定 Matplotlib 後端
+matplotlib.use("Agg")
+
+# === 1. 頁面設定 ===
 st.set_page_config(
     page_title="TW Scanner Pro 戰情室",
     page_icon="📈",
@@ -20,22 +28,198 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
-    .metric-card {
-        background-color: #262730; border: 1px solid #41444e;
-        padding: 15px; border-radius: 8px; color: white;
-    }
     .stTabs [data-baseweb="tab-list"] { gap: 2px; }
     .stTabs [data-baseweb="tab"] {
         height: 50px; white-space: pre-wrap; background-color: #1c1e26;
         border-radius: 4px 4px 0px 0px; color: white;
     }
     .stTabs [aria-selected="true"] { background-color: #4CAF50; color: white; }
-    /* 讓圖片 hover 時有效果 */
     a img:hover { opacity: 0.8; transition: 0.3s; border: 2px solid #4CAF50; }
 </style>
 """, unsafe_allow_html=True)
 
-# === 2. 輔助函式 ===
+# === 2. Google Sheets 連線 ===
+SHEET_NAME = "Stock_Notes"     
+JSON_KEY_FILE = "google_key.json" 
+
+@st.cache_resource
+def get_google_sheet_client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    if os.path.exists(JSON_KEY_FILE):
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEY_FILE, scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            print(f"本機 Key 讀取失敗: {e}")
+            return None
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            return gspread.authorize(creds)
+    except: pass
+    return None
+
+def get_sheet(worksheet_name="sheet1"):
+    client = get_google_sheet_client()
+    if not client: return None
+    try:
+        sh = client.open(SHEET_NAME)
+        if worksheet_name == "Favorites":
+            try: return sh.worksheet("Favorites")
+            except:
+                ws = sh.add_worksheet(title="Favorites", rows="100", cols="5")
+                ws.update_cell(1, 1, "code")
+                ws.update_cell(1, 2, "added_at")
+                return ws
+        return sh.sheet1 
+    except: return None
+
+# === 3. 我的最愛管理 (快取版) ===
+def init_faves_cache():
+    if 'faves_cache' not in st.session_state:
+        with st.spinner("正在同步關注清單..."):
+            st.session_state.faves_cache = fetch_favorites_from_google()
+
+def fetch_favorites_from_google():
+    sheet = get_sheet("Favorites")
+    if not sheet: return []
+    try:
+        records = sheet.get_all_records()
+        return [str(r['code']) for r in records if str(r['code']).strip()]
+    except: return []
+
+def get_favorites():
+    init_faves_cache()
+    return st.session_state.faves_cache
+
+def add_to_favorites(code):
+    sheet = get_sheet("Favorites")
+    if not sheet: 
+        st.error("無法連線 Google Sheet")
+        return
+    try:
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([str(code), updated_at])
+        
+        if 'faves_cache' in st.session_state:
+            if code not in st.session_state.faves_cache:
+                st.session_state.faves_cache.append(str(code))
+        
+        st.toast(f"✅ {code} 已加入最愛！")
+    except Exception as e: st.error(f"Error: {e}")
+
+def remove_from_favorites(code):
+    sheet = get_sheet("Favorites")
+    if not sheet: return
+    try:
+        cell = sheet.find(str(code))
+        if cell: sheet.delete_rows(cell.row)
+        
+        if 'faves_cache' in st.session_state:
+            if str(code) in st.session_state.faves_cache:
+                st.session_state.faves_cache.remove(str(code))
+        st.toast(f"🗑️ {code} 已移除")
+    except: pass
+
+# === 4. 即時繪圖 (產生圖片) ===
+def update_live_data(codes):
+    if not codes: return
+    live_dir = "runs/favorites_live"
+    os.makedirs(live_dir, exist_ok=True)
+    
+    for f in glob.glob(os.path.join(live_dir, "*.png")):
+        try: os.remove(f)
+        except: pass
+        
+    status = st.empty()
+    bar = st.progress(0)
+    
+    for i, code in enumerate(codes):
+        status.text(f"正在更新 {code} 最新走勢...")
+        try:
+            ticker = f"{code}.TW"
+            df = yf.Ticker(ticker).history(period="1y")
+            if df.empty:
+                ticker = f"{code}.TWO"
+                df = yf.Ticker(ticker).history(period="1y")
+            
+            if not df.empty:
+                df = df.iloc[-120:]
+                for w, c in zip([5, 20, 60], ['fuchsia', 'orange', 'green']):
+                    df[f'MA{w}'] = df['Close'].rolling(w).mean()
+                
+                ap = [mpf.make_addplot(df[f"MA{w}"], color=c, width=1) for w,c in zip([5,20,60],['fuchsia','orange','green'])]
+                fname = f"{code}_Live.png"
+                save_path = os.path.join(live_dir, fname)
+                mpf.plot(df, type="candle", volume=True, addplot=ap, title=f"{code} Live", style="yahoo",
+                         savefig=dict(fname=save_path, dpi=100, bbox_inches="tight"))
+        except: pass
+        bar.progress((i + 1) / len(codes))
+    
+    status.empty()
+    bar.empty()
+
+# === 5. 畫廊顯示 (純顯示) ===
+def get_image_html(file_path, link_url, width="100%"):
+    with open(file_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return f'<a href="{link_url}" target="_blank"><img src="data:image/png;base64,{data}" style="width:{width}; border-radius:5px;"></a>'
+
+def display_chart_gallery(image_paths, gallery_key):
+    if not image_paths:
+        st.info("目前無圖表 (請點擊上方按鈕更新行情)。")
+        return
+
+    current_faves = get_favorites() 
+
+    state_key = f"page_idx_{gallery_key}"
+    if state_key not in st.session_state: st.session_state[state_key] = 1
+
+    c1, c2 = st.columns([2, 6])
+    with c1:
+        items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
+
+    total_images = len(image_paths)
+    total_pages = (total_images + items_per_page - 1) // items_per_page
+    if st.session_state[state_key] > total_pages: st.session_state[state_key] = 1
+
+    col_prev, col_info, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if st.button("⬅️ 上一頁", key=f"p_{gallery_key}", disabled=(st.session_state[state_key]<=1), use_container_width=True):
+            st.session_state[state_key] -= 1
+            st.rerun()
+    with col_next:
+        if st.button("下一頁 ➡️", key=f"n_{gallery_key}", disabled=(st.session_state[state_key]>=total_pages), use_container_width=True):
+            st.session_state[state_key] += 1
+            st.rerun()
+    with col_info:
+        st.markdown(f"<div style='text-align: center; line-height: 38px;'><b>{st.session_state[state_key]} / {total_pages}</b></div>", unsafe_allow_html=True)
+
+    start_idx = (st.session_state[state_key] - 1) * items_per_page
+    current_batch = image_paths[start_idx:start_idx + items_per_page]
+    cols = st.columns(2 if items_per_page == 4 else 4)
+
+    for idx, img_path in enumerate(current_batch):
+        file_name = os.path.basename(img_path)
+        try: stock_code = file_name.split("_")[0]
+        except: stock_code = "0000"
+        wantgoo_url = f"https://www.wantgoo.com/stock/{stock_code}/technical-chart"
+
+        with cols[idx % (2 if items_per_page == 4 else 4)]:
+            st.markdown(get_image_html(img_path, wantgoo_url), unsafe_allow_html=True)
+            st.caption(f"{file_name}")
+            
+            is_faved = stock_code in current_faves
+            label = "★ 已關注" if is_faved else "☆ 加入關注"
+            btype = "primary" if is_faved else "secondary"
+            if st.button(label, key=f"s_{stock_code}_{gallery_key}_{idx}", type=btype, use_container_width=True):
+                if is_faved: remove_from_favorites(stock_code)
+                else: add_to_favorites(stock_code)
+                st.rerun()
+    st.caption(f"共 {total_images} 張")
+
+# === 6. 輔助函式 ===
 def get_unique_values(csv_path, col_name):
     if os.path.exists(csv_path):
         try:
@@ -51,181 +235,71 @@ def find_latest_run_dir(root="runs"):
     if not dirs: return None
     return max(dirs, key=os.path.getmtime)
 
-def get_image_html(file_path, link_url, width="100%"):
-    """將本地圖片轉為 Base64 並包裝成可點擊的 HTML 連結"""
-    with open(file_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode()
-    return f'<a href="{link_url}" target="_blank" title="點擊前往玩股網查看詳情"><img src="data:image/png;base64,{data}" style="width:{width}; border-radius:5px;"></a>'
+def get_history_runs(root="runs"):
+    if not os.path.exists(root): return []
+    dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    dirs = [d for d in dirs if "favorites_live" not in d]
+    dirs.sort(reverse=True)
+    return dirs
 
-def display_chart_gallery(image_paths, gallery_key):
-    """
-    通用圖表畫廊函式：改用 Button 翻頁並透過 session_state 記憶頁碼
-    """
-    if not image_paths:
-        st.info("沒有圖表可顯示。")
-        return
+def get_subfolders(parent_dir):
+    if not os.path.exists(parent_dir): return []
+    return [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
 
-    # 1. 初始化 Session State (記憶頁碼)
-    # 我們用 gallery_key 來區分不同分頁 (例如 top_picks vs strat_xxx) 的頁碼
-    state_key = f"page_idx_{gallery_key}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = 1
-
-    # 2. 控制列：選擇每頁張數
-    c1, c2 = st.columns([2, 6])
-    with c1:
-        items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
-
-    # 計算總頁數
-    total_images = len(image_paths)
-    total_pages = (total_images + items_per_page - 1) // items_per_page
-    
-    # 防呆：如果切換每頁張數導致當前頁碼超過總頁數，重置為第1頁
-    if st.session_state[state_key] > total_pages:
-        st.session_state[state_key] = 1
-
-    # 3. 翻頁按鈕區 (上一頁 / 頁碼資訊 / 下一頁)
-    col_prev, col_info, col_next = st.columns([1, 2, 1])
-
-    with col_prev:
-        # 如果在第1頁，禁用上一頁按鈕
-        disable_prev = (st.session_state[state_key] <= 1)
-        if st.button("⬅️ 上一頁", key=f"prev_{gallery_key}", disabled=disable_prev, use_container_width=True):
-            st.session_state[state_key] -= 1
-            st.rerun()
-
-    with col_next:
-        # 如果在最後一頁，禁用下一頁按鈕
-        disable_next = (st.session_state[state_key] >= total_pages)
-        if st.button("下一頁 ➡️", key=f"next_{gallery_key}", disabled=disable_next, use_container_width=True):
-            st.session_state[state_key] += 1
-            st.rerun()
-
-    with col_info:
-        # 居中顯示頁碼資訊
-        st.markdown(
-            f"<div style='text-align: center; line-height: 38px; font-weight: bold;'>"
-            f"第 {st.session_state[state_key]} 頁 / 共 {total_pages} 頁"
-            f"</div>", 
-            unsafe_allow_html=True
-        )
-
-    # 4. 圖片切片與顯示
-    current_page = st.session_state[state_key]
-    start_idx = (current_page - 1) * items_per_page
-    end_idx = start_idx + items_per_page
-    current_batch = image_paths[start_idx:end_idx]
-
-    # 設定 Grid：4張圖用2欄(大)，8張圖用4欄(中)
-    cols_count = 2 if items_per_page == 4 else 4
-    cols = st.columns(cols_count)
-
-    for idx, img_path in enumerate(current_batch):
-        file_name = os.path.basename(img_path)
-        try:
-            stock_code = file_name.split("_")[0]
-        except:
-            stock_code = "0000"
-        
-        wantgoo_url = f"https://www.wantgoo.com/stock/{stock_code}/technical-chart"
-
-        with cols[idx % cols_count]:
-            st.markdown(get_image_html(img_path, wantgoo_url), unsafe_allow_html=True)
-            st.caption(f"📄 {file_name}")
-
-    st.caption(f"顯示第 {start_idx+1} - {min(end_idx, total_images)} 張，共 {total_images} 張")
-
-
-# === 3. 左側邊欄：控制中心 ===
+# === 7. Sidebar ===
 with st.sidebar:
     st.title("🎛️ 掃描控制中心")
-    st.caption("TW Scanner Pro (Ultimate v2.7)")
+    st.caption("TW Scanner Pro (Ultimate v3.6 Clean)")
     
-    # --- A. 資料來源 ---
-    st.header("1. 資料來源")
     ticker_file = "tickers.csv"
     uploaded_file = st.file_uploader("上傳股票清單 (CSV)", type=["csv"])
-    
     if uploaded_file:
         with open("temp_tickers.csv", "wb") as f: f.write(uploaded_file.getbuffer())
         ticker_path = "temp_tickers.csv"
-    elif os.path.exists(ticker_file):
-        ticker_path = ticker_file
-    else:
-        st.error(f"找不到 {ticker_file}，請上傳！")
-        ticker_path = None
+    elif os.path.exists(ticker_file): ticker_path = ticker_file
+    else: ticker_path = None
 
     if ticker_path:
         groups = get_unique_values(ticker_path, "group")
         categories = get_unique_values(ticker_path, "category")
-    else:
-        groups, categories = ["全部"], ["全部"]
+    else: groups, categories = ["全部"], ["全部"]
 
     selected_group = st.selectbox("🏢 集團歸屬", groups)
     selected_category = st.selectbox("🏭 產業分類", categories)
-    min_volume = st.number_input("📊 最低成交量", min_value=0, value=1000000, step=100000, help="例如 1,000,000 代表 1000 張")
+    min_volume = st.number_input("📊 最低成交量", min_value=0, value=1000000, step=100000)
 
-    # --- B. 策略選擇 (改為 Checkbox) ---
-    st.header("2. 策略選擇")
+    st.header("策略選擇")
     all_strategies = {
-        "monitor": "純監控 (Monitor)",
-        "wave3": "波浪理論 (Wave 3)",
-        "ma_entangle": "均線糾結",
-        "vol_spike": "爆量 (Vol Spike)",
-        "open_high_low_vol": "開高走低",
-        "ma_cross": "均線交叉",
-        "breakout": "價格突破",
-        "gap": "跳空缺口",
-        "rsi": "RSI 指標"
+        "monitor": "純監控", "wave3": "波浪理論", "ma_entangle": "均線糾結",
+        "vol_spike": "爆量", "open_high_low_vol": "開高走低", "ma_cross": "均線交叉",
+        "breakout": "價格突破", "gap": "跳空缺口", "rsi": "RSI"
     }
-    
     selected_strats = []
-    st.caption("勾選要執行的策略：")
-    
-    # 使用兩欄排列 Checkbox 比較省空間
     s_col1, s_col2 = st.columns(2)
     for idx, (key, name) in enumerate(all_strategies.items()):
         col = s_col1 if idx % 2 == 0 else s_col2
-        # 預設勾選 Monitor
-        if col.checkbox(name, value=(key=="monitor")):
-            selected_strats.append(key)
+        if col.checkbox(name, value=(key=="monitor")): selected_strats.append(key)
     
-    enable_intersection = st.checkbox("開啟交集評分 (Intersection)", value=True)
+    enable_intersection = st.checkbox("開啟交集評分", value=True)
+    with st.expander("進階參數"):
+        w3_prebreak = st.slider("Wave3 緩衝 %", 0.0, 0.1, 0.03)
+        w3_exclude = st.checkbox("排除已突破", value=True)
+        ma_entangle_pct = st.slider("糾結幅度", 0.01, 0.05, 0.02)
+        vol_ratio = st.number_input("爆量倍數", 1.0, 5.0, 1.5)
 
-    # --- C. 進階參數 ---
-    with st.expander("⚙️ 進階參數設定", expanded=False):
-        if "wave3" in selected_strats:
-            st.markdown("**Wave 3 設定**")
-            w3_prebreak = st.slider("突破前緩衝區 %", 0.0, 0.1, 0.03, 0.01)
-            w3_exclude = st.checkbox("排除已突破", value=True)
-        else: w3_prebreak, w3_exclude = 0.03, True
-
-        if "ma_entangle" in selected_strats:
-            st.markdown("**均線糾結設定**")
-            ma_entangle_pct = st.slider("糾結幅度", 0.01, 0.05, 0.02, 0.01)
-        else: ma_entangle_pct = 0.02
-            
-        if "vol_spike" in selected_strats or "open_high_low_vol" in selected_strats:
-            st.markdown("**成交量設定**")
-            vol_ratio = st.number_input("爆量倍數", 1.0, 5.0, 1.5, 0.1)
-        else: vol_ratio = 1.5
-
-    # --- D. 系統設定 ---
-    st.header("3. 執行設定")
+    st.header("執行")
     intraday_mode = st.toggle("盤中即時模式", value=False)
     days_lookback = st.number_input("回測天數", value=360)
     run_btn = st.button("🚀 開始掃描", type="primary", use_container_width=True)
 
-# === 4. 主畫面邏輯 ===
-
+# === 8. 掃描執行邏輯 ===
 if 'latest_run_dir' not in st.session_state:
     st.session_state.latest_run_dir = find_latest_run_dir()
 
 if run_btn:
-    if not ticker_path: st.error("請先提供股票清單！")
-    elif not selected_strats: st.error("請至少選擇一個策略！")
+    if not ticker_path: st.error("請提供股票清單")
+    elif not selected_strats: st.error("請選擇策略")
     else:
-        # [修改] 加入 "-u" 參數以強制不快取輸出 (即時顯示用)
         cmd = [
             sys.executable, "-u", "tw_scanner_pro_final.py",
             "--tickers-file", ticker_path,
@@ -243,130 +317,128 @@ if run_btn:
         if "ma_entangle" in selected_strats: cmd.extend(["--ma-entangle-pct", str(ma_entangle_pct)])
         cmd.extend(["--vol-ratio", str(vol_ratio), "--oh-vol-ratio", str(vol_ratio)])
 
-        # === 進度條與終端機 UI 設置 ===
-        status_text = st.empty()
-        progress_bar = st.progress(0, text="初始化中...")
-        
-        # 增加即時 Log 顯示區 (Expander)
-        log_expander = st.expander("🖥️ 即時終端機 (Live Logs)", expanded=True)
-        with log_expander:
-            log_container = st.empty()
-        
-        logs = []
-        
+        st.info("🚀 掃描啟動中...")
+        status = st.empty()
+        pbar = st.progress(0)
+        logs = st.expander("Logs", expanded=True).empty()
+        log_lines = []
+        captured_dir = None
+        start_time = time.time()
+
         try:
-            # [修改] bufsize=1 代表行緩衝，stderr=subprocess.STDOUT 代表把錯誤也顯示在 log
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True, 
-                bufsize=1,
-                encoding="utf-8"
-            )
-            
-            total_tasks = len(selected_strats) + 1 # 策略數 + 初始化/收尾
-            tasks_done = 0
-            
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8")
             while True:
                 line = process.stdout.readline()
-                if not line and process.poll() is not None: 
-                    break
-                
+                if not line and process.poll() is not None: break
                 if line:
-                    clean_line = line.strip()
-                    logs.append(clean_line)
-                    # 只顯示最後 10 行避免太長
-                    log_container.code("\n".join(logs[-10:]), language="bash")
-                    
-                    # 簡單的進度判斷邏輯
-                    if "Running:" in clean_line or "Running strategy" in clean_line:
-                        strat_name = clean_line.split(":")[-1].strip()
-                        status_text.info(f"▶️ 正在執行策略: {strat_name}...")
-                        tasks_done += 1
-                        # 計算百分比
-                        pct = int((tasks_done / total_tasks) * 100)
-                        progress_bar.progress(min(pct, 95), text=f"執行中: {strat_name}")
-                    
-                    elif "Building intraday" in clean_line:
-                        status_text.warning("⏳ 正在抓取盤中即時數據...")
-                        
+                    l = line.strip()
+                    log_lines.append(l)
+                    logs.code("\n".join(log_lines[-8:]))
+                    if "__OUTPUT_PATH__:" in l:
+                        captured_dir = l.split("__OUTPUT_PATH__:")[1].strip()
+                        if not os.path.isabs(captured_dir): captured_dir = os.path.join(os.getcwd(), captured_dir)
+                    if "Running" in l: status.text(l)
             
-            # 等待進程完全結束
-            rc = process.poll()
-            
-            if rc == 0:
-                progress_bar.progress(100, text="✅ 掃描完成")
-                status_text.success("✅ 任務全部完成！")
-                time.sleep(1) # 給一點時間寫入檔案
-                st.session_state.latest_run_dir = find_latest_run_dir()
-                st.rerun() # 重新整理以顯示結果
-            else:
-                status_text.error("❌ 掃描異常終止")
-                st.error("掃描器回傳錯誤代碼，請檢查 Log。")
+            if process.poll() == 0:
+                end_time = time.time()
+                duration = end_time - start_time
+                minutes = int(duration // 60)
+                seconds = int(duration % 60)
+                time_str = f"{minutes} 分 {seconds} 秒"
 
-        except Exception as e: 
-            st.error(f"執行發生系統錯誤: {e}")
-
-# === 結果渲染 ===
-if st.session_state.latest_run_dir:
-    run_dir = st.session_state.latest_run_dir
-    run_time = os.path.basename(run_dir)
-    st.divider()
-    st.subheader(f"📊 掃描結果報告 (ID: {run_time})")
-
-    inter_csv = os.path.join(run_dir, "intersection_scored.csv")
-    
-    if os.path.exists(inter_csv):
-        df_res = pd.read_csv(inter_csv)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("總符合檔數", len(df_res))
-        c2.metric("滿分飆股 (Score>=2)", len(df_res[df_res['total_score'] >= 2]))
-        c3.metric("最高得分", df_res['total_score'].max() if not df_res.empty else 0)
-        
-        tab1, tab2 = st.tabs([ "🖼️ 精選圖表 (Top Picks)", "📂 策略明細"])
-
-        with tab1:
-            top_chart_dir = os.path.join(run_dir, "charts_intersection_top")
-            if os.path.exists(top_chart_dir):
-                images = glob.glob(os.path.join(top_chart_dir, "*.png"))
-                st.info(f"💡 點擊圖片可開啟玩股網技術分析 (共 {len(images)} 張)")
-                # 使用新的畫廊函式
-                display_chart_gallery(images, gallery_key="top_picks")
-            else:
-                st.warning("本次掃描沒有產生高分股 (Score >= 2) 的圖表。")
-
-        with tab2:
-            strat_files = glob.glob(os.path.join(run_dir, "*.csv"))
-            selected_csv = st.selectbox("選擇策略結果", [f for f in strat_files if "intersection" not in f])
-            
-            if selected_csv:
-                strat_name = os.path.basename(selected_csv).replace(".csv", "")
-                strat_chart_dir = os.path.join(run_dir, f"charts_{strat_name}")
+                pbar.progress(100)
+                status.success(f"✅ 任務全部完成！ (⏱️ 總耗時: {time_str})")
                 
-                if os.path.exists(strat_chart_dir):
-                    images = glob.glob(os.path.join(strat_chart_dir, "*.png"))
-                    st.divider()
-                    st.markdown(f"#### {strat_name} 圖表牆")
-                    st.info(f"💡 點擊圖片可開啟玩股網技術分析 (共 {len(images)} 張)")
-                    # 使用新的畫廊函式
-                    display_chart_gallery(images, gallery_key=f"strat_{strat_name}")
-    else:
-        st.info("尚無掃描結果")
-else:
-    st.info("👋 請設定左側參數並開始掃描。")
+                if captured_dir and os.path.exists(captured_dir):
+                    st.session_state.latest_run_dir = captured_dir
+                else:
+                    time.sleep(1)
+                    st.session_state.latest_run_dir = find_latest_run_dir()
+                st.rerun()
+            else: st.error("失敗")
+        except Exception as e: st.error(f"Error: {e}")
 
-    # === DEBUG 專用區域 (除錯完可刪除) ===
-with st.sidebar.expander("🐞 系統診斷 (Debug Tools)"):
-    if st.button("顯示檔案結構"):
-        st.write("當前工作目錄:", os.getcwd())
-        st.write("目錄下檔案:", os.listdir("."))
-        
-        if os.path.exists("runs"):
-            st.write("runs 資料夾內容:", os.listdir("runs"))
-            # 檢查最新的 runs 子資料夾
-            latest = find_latest_run_dir()
-            if latest:
-                st.write(f"最新結果 ({latest}) 內容:", os.listdir(latest))
+# === 9. 結果顯示區 (3 Tabs: 策略 -> 歷史 -> 最愛) ===
+if True: 
+    st.divider()
+    # [修改] 移除精選圖表，將最愛移至最後
+    tab1, tab2, tab_fav = st.tabs(["📂 策略明細", "📂 歷史/外部圖庫", "⭐ 我的最愛"])
+
+    # --- Tab 1: 策略明細 ---
+    with tab1:
+        if st.session_state.latest_run_dir:
+            run_dir = st.session_state.latest_run_dir
+            files = [f for f in glob.glob(os.path.join(run_dir, "*.csv")) if "intersection" not in f]
+            sel = st.selectbox("選擇策略", files, format_func=lambda x: os.path.basename(x).replace(".csv",""))
+            if sel:
+                sname = os.path.basename(sel).replace(".csv", "")
+                cdir = os.path.join(run_dir, f"charts_{sname}")
+                if os.path.exists(cdir):
+                    imgs = glob.glob(os.path.join(cdir, "*.png"))
+                    display_chart_gallery(imgs, f"sv_{sname}")
+                else: st.warning("無圖表")
+        else: st.info("請先執行掃描")
+
+    # --- Tab 2: 歷史/外部圖庫 ---
+    with tab2:
+        mode = st.radio("模式", ["歷史掃描紀錄", "指定外部路徑"], horizontal=True)
+        target_dir = None
+        if "歷史" in mode:
+            history_runs = get_history_runs()
+            if history_runs:
+                selected_run_id = st.selectbox("選擇時間", history_runs)
+                full_run_path = os.path.join("runs", selected_run_id)
+                subfolders = get_subfolders(full_run_path)
+                chart_folders = [f for f in subfolders if "charts_" in f]
+                if chart_folders:
+                    selected_sub = st.selectbox("選擇圖表類型", chart_folders)
+                    target_dir = os.path.join(full_run_path, selected_sub)
+                else: st.warning("無圖表資料夾")
+            else: st.info("無歷史紀錄")
         else:
-            st.error("找不到 runs 資料夾！掃描可能根本沒啟動。")
+            custom_path = st.text_input("輸入資料夾絕對路徑")
+            if custom_path:
+                if os.path.exists(custom_path) and os.path.isdir(custom_path):
+                    target_dir = custom_path
+                else: st.error("路徑錯誤")
+
+        if target_dir:
+            images = glob.glob(os.path.join(target_dir, "*.png"))
+            if images:
+                st.divider()
+                st.markdown(f"**📂 瀏覽:** `{target_dir}` ({len(images)} 張)")
+                display_chart_gallery(images, gallery_key=f"history_{os.path.basename(target_dir)}")
+            else: st.warning("無 PNG 圖片")
+
+    # --- Tab 3: 我的最愛 (移到最後) ---
+    with tab_fav:
+        init_faves_cache()
+        c_add, c_info = st.columns([1, 3])
+        with c_add:
+            new_fav = st.text_input("輸入代號 (如 2330)", key="nf")
+            if st.button("➕ 加入"):
+                if new_fav: 
+                    add_to_favorites(new_fav)
+                    st.rerun()
+        
+        faves = get_favorites()
+        if faves:
+            c_update_btn, c_time = st.columns([1, 3])
+            with c_update_btn:
+                if st.button("🔄 手動更新行情", type="primary"): 
+                    update_live_data(faves)
+                    st.rerun()
+            with c_time: 
+                st.caption(f"顯示資料夾內的圖片 (上次更新時間請見檔名或重新抓取)")
+            
+            live_dir = "runs/favorites_live"
+            display_paths = []
+            for code in faves:
+                expected_path = os.path.join(live_dir, f"{code}_Live.png")
+                if os.path.exists(expected_path):
+                    display_paths.append(expected_path)
+            
+            if not display_paths:
+                st.warning("⚠️ 目前還沒有圖片，請點擊上方「🔄 手動更新行情」按鈕來下載最新資料。")
+            display_chart_gallery(display_paths, "fav_live")
+        else: st.info("尚無關注股票。")
