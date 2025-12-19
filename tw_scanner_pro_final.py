@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TW Scanner Pro (Final Ultimate v2.8 - Streamlit Cloud Optimized)
-New Feature: Breakout Fade Strategy (過前高+開高走低+爆量)
+TW Scanner Pro (Final Ultimate v2.9 - Streamlit Cloud Optimized)
+Fix: Handle empty results in intersection merge (KeyError: 'code')
 """
 
 # --- [Fix 1] 必須在任何其他库导入之前设置 Matplotlib 后端 ---
@@ -484,6 +484,12 @@ def main():
             res.append({"code": c, "total_score": len(hits), "strategies": "_".join(hits)})
         
         res_df = pd.DataFrame(res)
+        
+        # --- [Fix] Handle empty results ---
+        if res_df.empty:
+            res_df = pd.DataFrame(columns=["code", "total_score", "strategies"])
+        # ----------------------------------
+        
         res_df = res_df.merge(universe[["code", "name", "market", "category", "group"]], on="code", how="left")
         res_df = res_df.sort_values("total_score", ascending=False)
         inter_csv = os.path.join(outdir, "intersection_scored.csv")
