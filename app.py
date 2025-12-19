@@ -11,6 +11,7 @@ import yfinance as yf
 import mplfinance as mpf
 import matplotlib
 from datetime import datetime
+from collections import Counter  # <--- [New] 用來計算分類數量
 from oauth2client.service_account import ServiceAccountCredentials
 
 # 設定 Matplotlib 後端
@@ -229,7 +230,7 @@ def display_chart_gallery(image_paths, gallery_key):
     cat_map = get_stock_category_mapping()
 
     # 1. 整理分類 (支援舊版檔名 與 新版檔名)
-    available_cats = set()
+    # 改用列表來儲存 (image_path, category) 方便後續計數
     img_cat_list = [] 
 
     for img in image_paths:
@@ -238,8 +239,7 @@ def display_chart_gallery(image_paths, gallery_key):
             parts = filename.split("_")
             code = parts[0]
             
-            # 嘗試從檔名直接讀取產業 (如果是新版檔名: 2330_台積電_半導體_Live.png)
-            # parts: ['2330', '台積電', '半導體', 'Live.png'] -> len >= 4
+            # 嘗試從檔名直接讀取產業
             if len(parts) >= 4 and "Live" in filename:
                 cat = parts[2] # 直接拿檔名裡的產業
             else:
@@ -247,36 +247,62 @@ def display_chart_gallery(image_paths, gallery_key):
                 cat = cat_map.get(code, "未分類")
         except:
             cat = "未分類"
-        available_cats.add(cat)
+        # 確保 cat 不為空
+        if not cat: cat = "未分類"
         img_cat_list.append((img, cat))
 
-    # 2. 顯示篩選器
-    sorted_cats = ["全部"] + sorted(list(available_cats))
+    # --- [New Logic] 計算每個分類的數量並產生選項 ---
+    cat_counts = Counter(cat for _, cat in img_cat_list)
     
+    # 建立 "全部 (總數)"
+    total_count = len(image_paths)
+    all_option_label = f"全部 ({total_count})"
+    
+    # 建立其他分類選項 (排序)
+    sorted_raw_cats = sorted(cat_counts.keys())
+    
+    # 建立 Selectbox 用的選項列表 與 對照表 (Label -> Real Category)
+    display_options = [all_option_label]
+    option_map = {all_option_label: "全部"}
+    
+    for cat in sorted_raw_cats:
+        count = cat_counts[cat]
+        label = f"{cat} ({count})"
+        display_options.append(label)
+        option_map[label] = cat
+    # ------------------------------------------------
+
+    # 2. 顯示篩選器
     c1, c2 = st.columns([2, 2])
     with c1:
-        selected_cat_filter = st.selectbox("🏭 依產品/產業篩選", sorted_cats, key=f"cat_filter_{gallery_key}")
+        # 使用帶有數量的選項
+        selected_option_label = st.selectbox("🏭 依產品/產業篩選", display_options, key=f"cat_filter_{gallery_key}")
+        # 查表找回真實的分類名稱
+        selected_real_cat = option_map[selected_option_label]
+        
     with c2:
         items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
 
     # 3. 過濾
-    if selected_cat_filter == "全部":
+    if selected_real_cat == "全部":
         filtered_paths = image_paths
     else:
-        filtered_paths = [img for img, cat in img_cat_list if cat == selected_cat_filter]
+        # 使用 selected_real_cat 來過濾
+        filtered_paths = [img for img, cat in img_cat_list if cat == selected_real_cat]
 
     if not filtered_paths:
-        st.warning(f"在分類「{selected_cat_filter}」下沒有找到圖片。")
+        st.warning(f"在分類「{selected_real_cat}」下沒有找到圖片。")
         return
 
-    # 分頁邏輯
+    # 分頁邏輯 (依賴 selected_option_label 變化來重置頁碼)
     state_key = f"page_idx_{gallery_key}"
     filter_key = f"last_filter_{gallery_key}"
-    if filter_key not in st.session_state: st.session_state[filter_key] = "全部"
+    if filter_key not in st.session_state: st.session_state[filter_key] = all_option_label
     
-    if st.session_state[filter_key] != selected_cat_filter:
+    # 如果選項改變 (即使是同分類但數量變了，也視為改變，重置頁碼是合理的)
+    if st.session_state[filter_key] != selected_option_label:
         st.session_state[state_key] = 1 
-        st.session_state[filter_key] = selected_cat_filter
+        st.session_state[filter_key] = selected_option_label
 
     if state_key not in st.session_state: st.session_state[state_key] = 1
 
@@ -317,7 +343,7 @@ def display_chart_gallery(image_paths, gallery_key):
                 if is_faved: remove_from_favorites(stock_code)
                 else: add_to_favorites(stock_code)
                 st.rerun()
-    st.caption(f"顯示: {selected_cat_filter} (共 {total_images} 張)")
+    st.caption(f"顯示: {selected_option_label} (共 {total_images} 張)")
 
 # === 7. 輔助函式 ===
 def get_unique_values(csv_path, col_name):
@@ -349,7 +375,7 @@ def get_subfolders(parent_dir):
 # === 8. Sidebar ===
 with st.sidebar:
     st.title("🎛️ 掃描控制中心")
-    st.caption("TW Scanner Pro (Ultimate v4.1 Smart Params)")
+    st.caption("TW Scanner Pro (Ultimate v4.2 Count)")
     
     ticker_file = "tickers.csv"
     uploaded_file = st.file_uploader("上傳股票清單 (CSV)", type=["csv"])
