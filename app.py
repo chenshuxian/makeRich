@@ -16,6 +16,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 設定 Matplotlib 後端
 matplotlib.use("Agg")
 
+# 嘗試設定中文字體 (避免圖表亂碼)
+try:
+    matplotlib.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'WenQuanYi Micro Hei', 'Arial']
+    matplotlib.rcParams['axes.unicode_minus'] = False
+except: pass
+
 # === 1. 頁面設定 ===
 st.set_page_config(
     page_title="TW Scanner Pro 戰情室",
@@ -122,12 +128,35 @@ def remove_from_favorites(code):
         st.toast(f"🗑️ {code} 已移除")
     except: pass
 
-# === 4. 即時繪圖 (產生圖片) ===
+# === 4. 資料映射 (讀取 名稱 與 產業) ===
+@st.cache_data
+def get_stock_info_mapping():
+    """讀取 tickers.csv 並回傳 {code: name} 與 {code: category}"""
+    name_map = {}
+    cat_map = {}
+    for f in ["temp_tickers.csv", "tickers.csv"]:
+        if os.path.exists(f):
+            try:
+                df = pd.read_csv(f, dtype=str)
+                if 'code' in df.columns:
+                    if 'name' in df.columns:
+                        name_map.update(dict(zip(df['code'], df['name'])))
+                    if 'category' in df.columns:
+                        cat_map.update(dict(zip(df['code'], df['category'])))
+            except: pass
+    return name_map, cat_map
+
+# === 5. 即時繪圖 (更新檔名邏輯) ===
 def update_live_data(codes):
     if not codes: return
+    
+    # 讀取對照表
+    name_map, cat_map = get_stock_info_mapping()
+    
     live_dir = "runs/favorites_live"
     os.makedirs(live_dir, exist_ok=True)
     
+    # 清除舊圖
     for f in glob.glob(os.path.join(live_dir, "*.png")):
         try: os.remove(f)
         except: pass
@@ -136,7 +165,20 @@ def update_live_data(codes):
     bar = st.progress(0)
     
     for i, code in enumerate(codes):
-        status.text(f"正在更新 {code} 最新走勢...")
+        # 獲取資訊 (如果找不到就顯示 Unknown)
+        stock_name = name_map.get(str(code), "")
+        stock_cat = cat_map.get(str(code), "")
+        
+        # 檔名處理：移除可能導致錯誤的特殊字元
+        safe_name = stock_name.replace("/", "").replace("\\", "").strip()
+        safe_cat = stock_cat.replace("/", "").replace("\\", "").strip()
+        
+        # 如果沒有資訊，預設空字串
+        if not safe_name: safe_name = "NA"
+        if not safe_cat: safe_cat = "一般"
+
+        status.text(f"更新 {code} {stock_name}...")
+        
         try:
             ticker = f"{code}.TW"
             df = yf.Ticker(ticker).history(period="1y")
@@ -150,9 +192,15 @@ def update_live_data(codes):
                     df[f'MA{w}'] = df['Close'].rolling(w).mean()
                 
                 ap = [mpf.make_addplot(df[f"MA{w}"], color=c, width=1) for w,c in zip([5,20,60],['fuchsia','orange','green'])]
-                fname = f"{code}_Live.png"
+                
+                # [關鍵] 新的檔名格式: 2330_台積電_半導體_Live.png
+                fname = f"{code}_{safe_name}_{safe_cat}_Live.png"
                 save_path = os.path.join(live_dir, fname)
-                mpf.plot(df, type="candle", volume=True, addplot=ap, title=f"{code} Live", style="yahoo",
+                
+                # 圖表標題也加上資訊
+                chart_title = f"{code} {stock_name} ({stock_cat})"
+                
+                mpf.plot(df, type="candle", volume=True, addplot=ap, title=chart_title, style="yahoo",
                          savefig=dict(fname=save_path, dpi=100, bbox_inches="tight"))
         except: pass
         bar.progress((i + 1) / len(codes))
@@ -160,27 +208,79 @@ def update_live_data(codes):
     status.empty()
     bar.empty()
 
-# === 5. 畫廊顯示 (純顯示) ===
+# === 6. 畫廊顯示 (純顯示) ===
 def get_image_html(file_path, link_url, width="100%"):
     with open(file_path, "rb") as f:
         data = base64.b64encode(f.read()).decode()
     return f'<a href="{link_url}" target="_blank"><img src="data:image/png;base64,{data}" style="width:{width}; border-radius:5px;"></a>'
+
+# 為了相容新的篩選邏輯，我們保留這個函式給一般掃描結果用
+@st.cache_data
+def get_stock_category_mapping():
+    _, cat_map = get_stock_info_mapping()
+    return cat_map
 
 def display_chart_gallery(image_paths, gallery_key):
     if not image_paths:
         st.info("目前無圖表 (請點擊上方按鈕更新行情)。")
         return
 
-    current_faves = get_favorites() 
+    current_faves = get_favorites()
+    cat_map = get_stock_category_mapping()
 
-    state_key = f"page_idx_{gallery_key}"
-    if state_key not in st.session_state: st.session_state[state_key] = 1
+    # 1. 整理分類 (支援舊版檔名 與 新版檔名)
+    available_cats = set()
+    img_cat_list = [] 
 
-    c1, c2 = st.columns([2, 6])
+    for img in image_paths:
+        try:
+            filename = os.path.basename(img)
+            parts = filename.split("_")
+            code = parts[0]
+            
+            # 嘗試從檔名直接讀取產業 (如果是新版檔名: 2330_台積電_半導體_Live.png)
+            # parts: ['2330', '台積電', '半導體', 'Live.png'] -> len >= 4
+            if len(parts) >= 4 and "Live" in filename:
+                cat = parts[2] # 直接拿檔名裡的產業
+            else:
+                # 舊版或掃描結果，查表
+                cat = cat_map.get(code, "未分類")
+        except:
+            cat = "未分類"
+        available_cats.add(cat)
+        img_cat_list.append((img, cat))
+
+    # 2. 顯示篩選器
+    sorted_cats = ["全部"] + sorted(list(available_cats))
+    
+    c1, c2 = st.columns([2, 2])
     with c1:
+        selected_cat_filter = st.selectbox("🏭 依產品/產業篩選", sorted_cats, key=f"cat_filter_{gallery_key}")
+    with c2:
         items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
 
-    total_images = len(image_paths)
+    # 3. 過濾
+    if selected_cat_filter == "全部":
+        filtered_paths = image_paths
+    else:
+        filtered_paths = [img for img, cat in img_cat_list if cat == selected_cat_filter]
+
+    if not filtered_paths:
+        st.warning(f"在分類「{selected_cat_filter}」下沒有找到圖片。")
+        return
+
+    # 分頁邏輯
+    state_key = f"page_idx_{gallery_key}"
+    filter_key = f"last_filter_{gallery_key}"
+    if filter_key not in st.session_state: st.session_state[filter_key] = "全部"
+    
+    if st.session_state[filter_key] != selected_cat_filter:
+        st.session_state[state_key] = 1 
+        st.session_state[filter_key] = selected_cat_filter
+
+    if state_key not in st.session_state: st.session_state[state_key] = 1
+
+    total_images = len(filtered_paths)
     total_pages = (total_images + items_per_page - 1) // items_per_page
     if st.session_state[state_key] > total_pages: st.session_state[state_key] = 1
 
@@ -197,7 +297,7 @@ def display_chart_gallery(image_paths, gallery_key):
         st.markdown(f"<div style='text-align: center; line-height: 38px;'><b>{st.session_state[state_key]} / {total_pages}</b></div>", unsafe_allow_html=True)
 
     start_idx = (st.session_state[state_key] - 1) * items_per_page
-    current_batch = image_paths[start_idx:start_idx + items_per_page]
+    current_batch = filtered_paths[start_idx:start_idx + items_per_page]
     cols = st.columns(2 if items_per_page == 4 else 4)
 
     for idx, img_path in enumerate(current_batch):
@@ -217,9 +317,9 @@ def display_chart_gallery(image_paths, gallery_key):
                 if is_faved: remove_from_favorites(stock_code)
                 else: add_to_favorites(stock_code)
                 st.rerun()
-    st.caption(f"共 {total_images} 張")
+    st.caption(f"顯示: {selected_cat_filter} (共 {total_images} 張)")
 
-# === 6. 輔助函式 ===
+# === 7. 輔助函式 ===
 def get_unique_values(csv_path, col_name):
     if os.path.exists(csv_path):
         try:
@@ -246,10 +346,10 @@ def get_subfolders(parent_dir):
     if not os.path.exists(parent_dir): return []
     return [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
 
-# === 7. Sidebar ===
+# === 8. Sidebar ===
 with st.sidebar:
     st.title("🎛️ 掃描控制中心")
-    st.caption("TW Scanner Pro (Ultimate v3.6 Clean)")
+    st.caption("TW Scanner Pro (Ultimate v4.1 Smart Params)")
     
     ticker_file = "tickers.csv"
     uploaded_file = st.file_uploader("上傳股票清單 (CSV)", type=["csv"])
@@ -270,10 +370,17 @@ with st.sidebar:
 
     st.header("策略選擇")
     all_strategies = {
-        "monitor": "純監控", "wave3": "波浪理論", "ma_entangle": "均線糾結",
-        "vol_spike": "爆量", "open_high_low_vol": "開高走低", "ma_cross": "均線交叉",
-        "breakout": "價格突破", "gap": "跳空缺口", "rsi": "RSI"
-    }
+            "monitor": "純監控", 
+            "wave3": "波浪理論 (Wave3)", 
+            "ma_entangle": "均線糾結",
+            "vol_spike": "爆量 (Spike)", 
+            "open_high_low_vol": "開高走低 (OHLV)", 
+            "ma_cross": "均線交叉",
+            "breakout": "價格突破", 
+            "gap": "跳空缺口", 
+            "rsi": "RSI",
+            "breakout_fade": "過前高+開高走低+爆量 (Breakout Fade)" 
+        }
     selected_strats = []
     s_col1, s_col2 = st.columns(2)
     for idx, (key, name) in enumerate(all_strategies.items()):
@@ -281,18 +388,32 @@ with st.sidebar:
         if col.checkbox(name, value=(key=="monitor")): selected_strats.append(key)
     
     enable_intersection = st.checkbox("開啟交集評分", value=True)
-    with st.expander("進階參數"):
-        w3_prebreak = st.slider("Wave3 緩衝 %", 0.0, 0.1, 0.03)
-        w3_exclude = st.checkbox("排除已突破", value=True)
-        ma_entangle_pct = st.slider("糾結幅度", 0.01, 0.05, 0.02)
-        vol_ratio = st.number_input("爆量倍數", 1.0, 5.0, 1.5)
+    
+    # [Updated] 參數分組，視覺上更清晰，邏輯上後端有綁定
+    with st.expander("進階參數設定 (僅對應策略生效)", expanded=False):
+        st.markdown("**1. 通用/爆量設定** (影響 Vol Spike, OHLV, Fade)")
+        vol_ratio = st.number_input("爆量倍數 (vs 均量)", 1.0, 5.0, 1.5)
+        
+        st.markdown("---")
+        st.markdown("**2. 波浪理論 (Wave3) 設定**")
+        w3_prebreak = st.slider("Wave3 預突破緩衝 %", 0.0, 0.1, 0.03)
+        w3_exclude = st.checkbox("Wave3 排除已大漲突破", value=True)
+        
+        st.markdown("---")
+        st.markdown("**3. 均線糾結設定**")
+        ma_entangle_pct = st.slider("糾結幅度閾值", 0.01, 0.05, 0.02)
+        
+        st.markdown("---")
+        st.markdown("**4. 避雷針/假突破 (Breakout Fade) 設定**")
+        bf_lookback = st.number_input("前高判斷天數 (Lookback)", 10, 360, 60)
+        bf_vol_ratio = st.number_input("避雷針專用爆量倍數", 1.0, 10.0, 1.5)
 
     st.header("執行")
     intraday_mode = st.toggle("盤中即時模式", value=False)
     days_lookback = st.number_input("回測天數", value=360)
     run_btn = st.button("🚀 開始掃描", type="primary", use_container_width=True)
 
-# === 8. 掃描執行邏輯 ===
+# === 9. 掃描執行邏輯 ===
 if 'latest_run_dir' not in st.session_state:
     st.session_state.latest_run_dir = find_latest_run_dir()
 
@@ -300,6 +421,7 @@ if run_btn:
     if not ticker_path: st.error("請提供股票清單")
     elif not selected_strats: st.error("請選擇策略")
     else:
+        # 1. 基礎指令
         cmd = [
             sys.executable, "-u", "tw_scanner_pro_final.py",
             "--tickers-file", ticker_path,
@@ -307,16 +429,41 @@ if run_btn:
             "--min-volume", str(min_volume),
             "--days", str(days_lookback)
         ]
+        
+        # 2. 條件式參數綁定 (只有選了該策略，才帶入對應參數)
+        
+        # (A) 通用/篩選
         if enable_intersection: cmd.append("--make-intersection")
         if selected_group != "全部": cmd.extend(["--filter-group", selected_group])
         if selected_category != "全部": cmd.extend(["--filter-category", selected_category])
         if intraday_mode: cmd.append("--intraday-once")
+
+        # (B) 策略專屬參數
+        
+        # Wave3
         if "wave3" in selected_strats:
             cmd.extend(["--wave3-prebreak-pct", str(w3_prebreak)])
             if w3_exclude: cmd.append("--wave3-exclude-breakout")
-        if "ma_entangle" in selected_strats: cmd.extend(["--ma-entangle-pct", str(ma_entangle_pct)])
-        cmd.extend(["--vol-ratio", str(vol_ratio), "--oh-vol-ratio", str(vol_ratio)])
 
+        # MA Entangle
+        if "ma_entangle" in selected_strats:
+            cmd.extend(["--ma-entangle-pct", str(ma_entangle_pct)])
+
+        # Breakout Fade (新策略)
+        if "breakout_fade" in selected_strats:
+            cmd.extend(["--bf-lookback", str(bf_lookback), "--bf-vol-ratio", str(bf_vol_ratio)])
+            
+        # Volume Related (只要有用到量的策略，就帶入通用 vol_ratio)
+        vol_strategies = ["vol_spike", "open_high_low_vol", "breakout_fade"]
+        if any(s in selected_strats for s in vol_strategies):
+             cmd.extend(["--vol-ratio", str(vol_ratio), "--oh-vol-ratio", str(vol_ratio)])
+
+        # 3. 顯示完整指令 (Debug用)
+        full_command_str = " ".join(cmd)
+        st.markdown("### 📋 即將執行的指令 (Smart Params)")
+        st.code(full_command_str, language="bash")
+
+        # 4. 開始執行
         st.info("🚀 掃描啟動中...")
         status = st.empty()
         pbar = st.progress(0)
@@ -358,10 +505,9 @@ if run_btn:
             else: st.error("失敗")
         except Exception as e: st.error(f"Error: {e}")
 
-# === 9. 結果顯示區 (3 Tabs: 策略 -> 歷史 -> 最愛) ===
+# === 10. 結果顯示區 (3 Tabs) ===
 if True: 
     st.divider()
-    # [修改] 移除精選圖表，將最愛移至最後
     tab1, tab2, tab_fav = st.tabs(["📂 策略明細", "📂 歷史/外部圖庫", "⭐ 我的最愛"])
 
     # --- Tab 1: 策略明細 ---
@@ -410,7 +556,7 @@ if True:
                 display_chart_gallery(images, gallery_key=f"history_{os.path.basename(target_dir)}")
             else: st.warning("無 PNG 圖片")
 
-    # --- Tab 3: 我的最愛 (移到最後) ---
+    # --- Tab 3: 我的最愛 ---
     with tab_fav:
         init_faves_cache()
         c_add, c_info = st.columns([1, 3])
@@ -432,11 +578,17 @@ if True:
                 st.caption(f"顯示資料夾內的圖片 (上次更新時間請見檔名或重新抓取)")
             
             live_dir = "runs/favorites_live"
+            
+            # [修正] 搜尋邏輯改變：現在要找代號開頭的檔案
+            # 檔名格式: 2330_台積電_半導體_Live.png
             display_paths = []
+            all_live_files = glob.glob(os.path.join(live_dir, "*.png"))
+            
             for code in faves:
-                expected_path = os.path.join(live_dir, f"{code}_Live.png")
-                if os.path.exists(expected_path):
-                    display_paths.append(expected_path)
+                # 模糊搜尋：找到該代號開頭的檔案
+                matches = [f for f in all_live_files if os.path.basename(f).startswith(f"{code}_")]
+                if matches:
+                    display_paths.extend(matches)
             
             if not display_paths:
                 st.warning("⚠️ 目前還沒有圖片，請點擊上方「🔄 手動更新行情」按鈕來下載最新資料。")

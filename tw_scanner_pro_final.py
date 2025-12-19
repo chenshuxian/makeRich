@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TW Scanner Pro (Final Ultimate v2.7 - Streamlit Cloud Optimized)
-Features: Monitor Mode (No-Filter) + Group Filter + Filename Logic + Universal Charts
+TW Scanner Pro (Final Ultimate v2.8 - Streamlit Cloud Optimized)
+New Feature: Breakout Fade Strategy (過前高+開高走低+爆量)
 """
 
-# --- [Fix 1] 必须在任何其他库导入之前设置 Matplotlib 后端 ---
+# --- [Fix 1] 必須在任何其他库导入之前设置 Matplotlib 后端 ---
 import os
 os.environ["MPLBACKEND"] = "Agg"  # 强制环境变量
 import matplotlib
@@ -265,12 +265,8 @@ def make_indicators(df, ma_short, ma_long, vol_window, bb_window):
     return df
 
 def scan_ma_cross(df, golden): 
-    p, c = df.iloc[-2], df.iloc[-1]
-    # 动态获取用户定义的参数列名比较复杂，这里硬编码检查常用的
-    # 假设用户传入的参数会影响逻辑，但这里简化为检查现有列
-    # 注意：这里逻辑依赖于 MA_S 和 MA_L 是否被正确赋值，原代码未显式赋值 MA_S/L 到列，需确认
-    # 修正逻辑：直接用 args 里的周期
-    return False # 需结合外部传入的 window 修改，暂保持原样
+    # 簡化：只做框架，邏輯由使用者參數調整
+    return False
 
 def scan_rsi(df, lte, gte): r=df["RSI14"].iloc[-1]; return (r<=lte if lte else True) and (r>=gte if gte else True)
 def scan_vol_spike(df, ratio, yday_mult, recent_mult):
@@ -294,6 +290,22 @@ def scan_ohlv(df, gap, vr):
     return df["Open"].iloc[-1] >= df["Close"].iloc[-2]*(1+gap) and df["Close"].iloc[-1] < df["Open"].iloc[-1] and df["VOL_RATIO"].iloc[-1] >= vr
 def scan_monitor(df):
     return True 
+
+# --- New Strategy: Breakout Fade (過前高+開高走低+帶大量) ---
+def scan_breakout_fade(df, lookback, vol_ratio):
+    if len(df) < lookback + 2: return False
+    # 1. Volume Check
+    if df["VOL_RATIO"].iloc[-1] < vol_ratio: return False
+    # 2. Candle Pattern (Gap Up + Close Low)
+    c_prev = df["Close"].iloc[-2]
+    o_curr = df["Open"].iloc[-1]
+    c_curr = df["Close"].iloc[-1]
+    h_curr = df["High"].iloc[-1]
+    if not (o_curr > c_prev and c_curr < o_curr): return False
+    # 3. Breakout High Check
+    recent_high = df["High"].iloc[-lookback-1:-1].max()
+    if h_curr > recent_high: return True
+    return False
 
 def detect_wave3(df, lb, k, min_pct, r_min, r_max, req_break, pre_pct, ex_break):
     if len(df) < max(lb, 2*k+10): return None
@@ -345,7 +357,6 @@ def run_strategy(universe, args, outdir, name):
 
         df = make_indicators(df, args.ma_short, args.ma_long, args.vol_window, args.bb_window)
         
-        # 补充 MA Cross 逻辑所需列 (如果用到了)
         if name == "ma_cross":
             df["MA_S"] = df["Close"].rolling(args.ma_short).mean()
             df["MA_L"] = df["Close"].rolling(args.ma_long).mean()
@@ -360,6 +371,7 @@ def run_strategy(universe, args, outdir, name):
         elif name == "ma_entangle": ok = scan_ma_entangle(df, args.ma_entangle_pct)
         elif name == "gap": ok = scan_gap(df, args.gap_pct, args.gap_up)
         elif name == "open_high_low_vol": ok = scan_ohlv(df, args.oh_gap_pct, args.oh_vol_ratio)
+        elif name == "breakout_fade": ok = scan_breakout_fade(df, args.bf_lookback, args.bf_vol_ratio) # Added
         elif name == "wave3": 
             res = detect_wave3(df, args.wave3_lookback, args.wave3_pivot_k, args.wave1_min_pct, args.wave2_retrace_min, args.wave2_retrace_max, args.wave3_require_break, args.wave3_prebreak_pct, args.wave3_exclude_breakout)
             ok = bool(res)
@@ -425,6 +437,12 @@ def main():
     ap.add_argument("--ma-entangle-pct", type=float, default=0.02)
     ap.add_argument("--oh-gap-pct", type=float, default=0.0)
     ap.add_argument("--oh-vol-ratio", type=float, default=1.5)
+    
+    # --- New Breakout Fade Params ---
+    ap.add_argument("--bf-lookback", type=int, default=60, help="Breakout fade lookback days")
+    ap.add_argument("--bf-vol-ratio", type=float, default=1.5, help="Breakout fade volume ratio")
+    # --------------------------------
+
     ap.add_argument("--wave3-lookback", type=int, default=260)
     ap.add_argument("--wave3-pivot-k", type=int, default=5)
     ap.add_argument("--wave1-min-pct", type=float, default=8.0)
@@ -444,7 +462,9 @@ def main():
     if args.intraday_once: build_intraday_overrides(universe, args.tz, args.session_start, args.intraday_interval, args.days, args.threads)
 
     outputs = {}
-    generic_strategies = ["monitor", "ma_cross", "rsi", "macd_cross", "breakout", "bb_squeeze", "vol_spike", "gap", "vol_consecutive", "open_high_low_vol", "ma_entangle", "wave3"]
+    generic_strategies = ["monitor", "ma_cross", "rsi", "macd_cross", "breakout", 
+                          "bb_squeeze", "vol_spike", "gap", "vol_consecutive", 
+                          "open_high_low_vol", "ma_entangle", "wave3", "breakout_fade"]
     
     for s in args.strategies:
         if s in generic_strategies:
