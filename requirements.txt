@@ -9,3 +9,6 @@ html5lib
 openpyxl
 gspread 
 oauth2client
+plotly
+numpy
+google-generativeai
