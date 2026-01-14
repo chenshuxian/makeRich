@@ -357,11 +357,23 @@ def run_strategy(universe, args, outdir, name):
 
         df = make_indicators(df, args.ma_short, args.ma_long, args.vol_window, args.bb_window)
         
+        # ... 原本的程式碼 ...
         if name == "ma_cross":
             df["MA_S"] = df["Close"].rolling(args.ma_short).mean()
             df["MA_L"] = df["Close"].rolling(args.ma_long).mean()
         
+        # ====== [新增] 強制過濾：收盤價必須守住 10 日線 ======
+        # 計算 MA10
+        ma10 = df["Close"].rolling(10).mean()
+        
+        # 條件：今天的收盤價 (Close) 必須大於等於 今天的 MA10
+        # 如果您想要更嚴格的「回測不破」，可以用 Low (最低價) >= MA10
+        if df["Close"].iloc[-1] < ma10.iloc[-1]:
+            continue 
+        # ===================================================
+
         ok, res = False, {}
+# ... 後面的程式碼 ...
         
         if name == "monitor": ok = scan_monitor(df)
         elif name == "ma_cross": ok = scan_ma_cross(df, args.golden)

@@ -412,8 +412,26 @@ def get_unique_values(csv_path, col_name):
     if os.path.exists(csv_path):
         try:
             df = pd.read_csv(csv_path, dtype=str)
-            if col_name in df.columns: return ["全部"] + sorted(df[col_name].dropna().unique().tolist())
-        except: pass
+            if col_name in df.columns:
+                # === 修改開始 ===
+                # 1. 取出該欄位所有非空值
+                raw_list = df[col_name].dropna().tolist()
+                # 2. 用逗號、頓號或分號分割字串，並去除前後空白
+                import re
+                split_items = set()
+                for item in raw_list:
+                    # 支援逗號(,)、分號(;)、頓號(、)、斜線(/) 進行分割
+                    parts = re.split(r'[,;、/]', str(item))
+                    for p in parts:
+                        clean_p = p.strip()
+                        if clean_p:
+                            split_items.add(clean_p)
+                
+                return ["全部"] + sorted(list(split_items))
+                # === 修改結束 ===
+        except Exception as e: 
+            print(f"Error reading csv: {e}")
+            pass
     return ["全部"]
 
 def find_latest_run_dir(root="runs"):
