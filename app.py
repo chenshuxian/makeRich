@@ -155,7 +155,7 @@ def get_stock_info_mapping():
             except: pass
     return name_map, cat_map
 
-# === 5. 即時繪圖 ===
+# === 5. 即時繪圖 (Update: 加入 MA120/MA240) ===
 def update_live_data(codes):
     if not codes: return
     name_map, cat_map = get_stock_info_mapping()
@@ -164,30 +164,57 @@ def update_live_data(codes):
     for f in glob.glob(os.path.join(live_dir, "*.png")):
         try: os.remove(f)
         except: pass
+        
     status = st.empty()
     bar = st.progress(0)
+    
     for i, code in enumerate(codes):
         stock_name = name_map.get(str(code), "")
         stock_cat = cat_map.get(str(code), "")
         safe_name = stock_name.replace("/", "").strip() or "NA"
         safe_cat = stock_cat.replace("/", "").strip() or "一般"
         status.text(f"更新 {code} {stock_name}...")
+        
         try:
             ticker = f"{code}.TW"
-            df = yf.Ticker(ticker).history(period="1y")
+            # [Modified] 下載 2 年資料確保 MA240
+            df = yf.Ticker(ticker).history(period="2y")
             if df.empty:
                 ticker = f"{code}.TWO"
-                df = yf.Ticker(ticker).history(period="1y")
-            if not df.empty:
-                df = df.iloc[-120:]
-                for w, c in zip([5, 20, 60], ['fuchsia', 'orange', 'green']):
-                    df[f'MA{w}'] = df['Close'].rolling(w).mean()
-                ap = [mpf.make_addplot(df[f"MA{w}"], color=c, width=1) for w,c in zip([5,20,60],['fuchsia','orange','green'])]
+                df = yf.Ticker(ticker).history(period="2y")
+            
+            if not df.empty and len(df) > 30:
+                # [Modified] 計算所有均線
+                for w in (5, 10, 20, 60, 120, 240):
+                    if f"MA{w}" not in df.columns:
+                        df[f"MA{w}"] = df["Close"].rolling(w).mean()
+                
+                # 切片 (只畫最後 180 天)
+                plot_df = df.iloc[-180:].copy()
+                
+                # [Modified] 設定 AddPlots (包含 120, 240)
+                ap = [
+                    mpf.make_addplot(plot_df["MA5"], width=1, color='fuchsia'),
+                    mpf.make_addplot(plot_df["MA20"], width=1, color='orange'),
+                    mpf.make_addplot(plot_df["MA60"], width=1, color='green'),
+                    mpf.make_addplot(plot_df["MA120"], width=1, color='blue'),
+                    mpf.make_addplot(plot_df["MA240"], width=1, color='red')
+                ]
+                
                 fname = f"{code}_{safe_name}_{safe_cat}_Live.png"
-                mpf.plot(df, type="candle", volume=True, addplot=ap, title=f"{code} {stock_name} ({stock_cat})",
+                title = f"{code} {stock_name} ({stock_cat}) - Live"
+
+                mpf.plot(plot_df, type="candle", volume=True, addplot=ap, title=title, 
+                         style="yahoo", figratio=(16,9), figscale=1.1,
                          savefig=dict(fname=os.path.join(live_dir, fname), dpi=100, bbox_inches="tight"))
-        except: pass
+                
+                matplotlib.pyplot.close('all')
+
+        except Exception as e:
+            print(f"Error updating {code}: {e}")
+            pass
         bar.progress((i + 1) / len(codes))
+        
     status.empty()
     bar.empty()
 
@@ -201,29 +228,25 @@ def analyze_stock_with_ai(api_key, code):
         stock = yf.Ticker(ticker_str)
         info = stock.info
         
-        # 嘗試抓取上櫃
         if 'symbol' not in info:
             ticker_str = f"{code}.TWO"
             stock = yf.Ticker(ticker_str)
             info = stock.info
 
-        # 1. 抓取基礎資訊
         current_price = info.get('currentPrice', '未知')
         sector = info.get('sector', '未知')
         industry = info.get('industry', '未知')
         
-        # 2. 抓取新聞
         news_list = stock.news
         news_summary = ""
         if news_list:
-            for n in news_list[:5]: # 取前5則
+            for n in news_list[:5]:
                 title = n.get('title', '無標題')
                 publisher = n.get('publisher', '未知來源')
                 news_summary += f"- {title} ({publisher})\n"
         else:
             news_summary = "近期無重大新聞，請依據產業知識進行分析。"
 
-        # 3. 設定 AI
         genai.configure(api_key=api_key)
         
         prompt = f"""
@@ -251,7 +274,6 @@ def analyze_stock_with_ai(api_key, code):
         請用繁體中文回答，語氣專業且條理分明。
         """
 
-        # 多模型輪詢機制
         candidate_models = [
             "gemini-2.0-flash",       
             "gemini-2.0-flash-exp",   
@@ -281,7 +303,7 @@ def analyze_stock_with_ai(api_key, code):
     except Exception as e:
         return f"❌ 分析失敗: {str(e)}"
 
-# === 7. 畫廊顯示 (包含 AI 按鈕) ===
+# === 7. 畫廊顯示 ===
 def get_image_html(file_path, link_url, width="100%"):
     with open(file_path, "rb") as f:
         data = base64.b64encode(f.read()).decode()
@@ -300,7 +322,6 @@ def display_chart_gallery(image_paths, gallery_key):
     cat_map = get_stock_category_mapping()
     img_cat_list = [] 
     
-    # 建立 (path, cat) 的列表
     for img in image_paths:
         try:
             filename = os.path.basename(img)
@@ -333,7 +354,6 @@ def display_chart_gallery(image_paths, gallery_key):
         selected_real_cat = option_map[selected_option_label]
     with c2: items_per_page = st.radio("每頁顯示", [4, 8], horizontal=True, key=f"ipp_{gallery_key}")
     
-    # [Fix] 這裡確保 filtered_paths 永遠是 (img, cat) 的 Tuple 列表
     if selected_real_cat == "全部":
         filtered_paths = img_cat_list
     else:
@@ -367,10 +387,9 @@ def display_chart_gallery(image_paths, gallery_key):
     current_batch = filtered_paths[start_idx:start_idx + items_per_page]
     cols = st.columns(2 if items_per_page == 4 else 4)
     
-    # 取得全域 API Key
     api_key = st.session_state.get('gemini_api_key', '')
 
-    for idx, (img_path, cat) in enumerate(current_batch): # 這裡現在可以正確解包了
+    for idx, (img_path, cat) in enumerate(current_batch): 
         file_name = os.path.basename(img_path)
         try: stock_code = file_name.split("_")[0]
         except: stock_code = "0000"
@@ -379,7 +398,6 @@ def display_chart_gallery(image_paths, gallery_key):
             st.markdown(get_image_html(img_path, f"https://www.wantgoo.com/stock/{stock_code}/technical-chart"), unsafe_allow_html=True)
             st.caption(f"{file_name}")
             
-            # 按鈕列
             b_col1, b_col2 = st.columns([1, 1])
             is_faved = stock_code in current_faves
             
@@ -389,7 +407,6 @@ def display_chart_gallery(image_paths, gallery_key):
                     else: add_to_favorites(stock_code)
                     st.rerun()
             
-            # AI 分析按鈕
             if "fav_live" in gallery_key or "history" in gallery_key:
                 with b_col2:
                     if st.button("🤖 產業診斷", key=f"ai_{stock_code}_{gallery_key}_{idx}", use_container_width=True):
@@ -400,7 +417,6 @@ def display_chart_gallery(image_paths, gallery_key):
                                 analysis = analyze_stock_with_ai(api_key, stock_code)
                                 st.session_state[f"ai_res_{stock_code}"] = analysis
             
-            # 顯示分析結果 (如果存在)
             if f"ai_res_{stock_code}" in st.session_state:
                 with st.expander(f"📊 {stock_code} 產業深度報告", expanded=True):
                     st.markdown(st.session_state[f"ai_res_{stock_code}"])
@@ -413,22 +429,16 @@ def get_unique_values(csv_path, col_name):
         try:
             df = pd.read_csv(csv_path, dtype=str)
             if col_name in df.columns:
-                # === 修改開始 ===
-                # 1. 取出該欄位所有非空值
                 raw_list = df[col_name].dropna().tolist()
-                # 2. 用逗號、頓號或分號分割字串，並去除前後空白
                 import re
                 split_items = set()
                 for item in raw_list:
-                    # 支援逗號(,)、分號(;)、頓號(、)、斜線(/) 進行分割
                     parts = re.split(r'[,;、/]', str(item))
                     for p in parts:
                         clean_p = p.strip()
                         if clean_p:
                             split_items.add(clean_p)
-                
                 return ["全部"] + sorted(list(split_items))
-                # === 修改結束 ===
         except Exception as e: 
             print(f"Error reading csv: {e}")
             pass
@@ -453,11 +463,11 @@ def get_subfolders(parent_dir):
 # === 9. Sidebar ===
 with st.sidebar:
     st.title("🎛️ 掃描控制中心")
-    st.caption("TW Scanner Pro (Industry Focus v5.3)")
+    st.caption("TW Scanner Pro (Industry Focus v5.6)")
     
     with st.expander("🔑 AI 設定 (Gemini)", expanded=True):
         gemini_api_key = st.text_input("API Key", type="password", help="請輸入 API Key 以啟用智能分析")
-        st.session_state['gemini_api_key'] = gemini_api_key # 存入 Session 供全域使用
+        st.session_state['gemini_api_key'] = gemini_api_key 
 
     ticker_file = "tickers.csv"
     uploaded_file = st.file_uploader("上傳股票清單 (CSV)", type=["csv"])
@@ -487,7 +497,8 @@ with st.sidebar:
             "breakout": "價格突破", 
             "gap": "跳空缺口", 
             "rsi": "RSI",
-            "breakout_fade": "過前高+開高走低+爆量 (Breakout Fade)" 
+            "breakout_fade": "過前高+開高走低+爆量 (Breakout Fade)",
+            "pullback_ma20": "回踩 20MA (Breakout+Pullback)"
         }
     selected_strats = []
     s_col1, s_col2 = st.columns(2)
@@ -497,19 +508,28 @@ with st.sidebar:
     
     enable_intersection = st.checkbox("開啟交集評分", value=True)
     
-    # [New] 新增參數設定
     with st.expander("進階參數設定", expanded=False):
         vol_ratio = st.number_input("爆量倍數 (vs 均量)", 1.0, 5.0, 1.5)
-        
-        # [新增] 今日量 vs 昨日量 (倍數)
         vol_vs_yesterday = st.number_input(
             "爆量: 今日量 vs 昨日量 (倍數)", 
             min_value=0.0, max_value=10.0, value=0.0, step=0.5, 
-            help="設定 2.0 代表今日成交量需大於昨日 2 倍。設為 0 代表不啟用此條件。主要用於「爆量 (Spike)」策略。"
+            help="設定 2.0 代表今日成交量需大於昨日 2 倍。設為 0 代表不啟用此條件。"
         )
 
         w3_prebreak = st.slider("Wave3 緩衝 %", 0.0, 0.1, 0.03)
         ma_entangle_pct = st.slider("糾結幅度", 0.01, 0.05, 0.02)
+
+        st.caption("--- 回踩策略參數 ---")
+        pullback_days = st.number_input(
+            "突破後 N 日內回踩", 
+            min_value=1, max_value=30, value=5, step=1,
+            help="設定必須在過去幾天內發生過「黃金交叉」才算符合回踩條件。"
+        )
+        pullback_th = st.slider(
+            "回踩 20MA 誤差範圍 (%)", 
+            min_value=0.5, max_value=5.0, value=1.5, step=0.1,
+            help="股價最低點 (Low) 與 20MA 的距離百分比。"
+        )
 
     st.header("執行")
     intraday_mode = st.toggle("盤中即時模式", value=False)
@@ -548,11 +568,15 @@ if run_btn:
             cmd.extend(["--wave3-prebreak-pct", str(w3_prebreak), "--wave3-exclude-breakout"])
         if "ma_entangle" in selected_strats:
             cmd.extend(["--ma-entangle-pct", str(ma_entangle_pct)])
+        
+        if "pullback_ma20" in selected_strats:
+            cmd.extend(["--pullback-threshold", str(pullback_th / 100.0)])
+            cmd.extend(["--pullback-days", str(pullback_days)])
+
         vol_strategies = ["vol_spike", "open_high_low_vol", "breakout_fade"]
         if any(s in selected_strats for s in vol_strategies):
              cmd.extend(["--vol-ratio", str(vol_ratio), "--oh-vol-ratio", str(vol_ratio)])
 
-        # [新增] 傳遞 vol-vs-yesterday 參數
         if vol_vs_yesterday > 0:
             cmd.extend(["--vol-vs-yesterday", str(vol_vs_yesterday)])
 
