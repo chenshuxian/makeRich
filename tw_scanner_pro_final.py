@@ -265,7 +265,7 @@ def make_indicators(df, ma_short, ma_long, vol_window, bb_window):
     df["MACD"] = df["Close"].ewm(span=12, adjust=False).mean() - df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     vma = df["Volume"].rolling(vol_window).mean().shift(1)
-    df["VOL_MA"] = vma.fillna(method="bfill")
+    df["VOL_MA"] = vma.bfill()
     df["VOL_RATIO"] = df["Volume"] / df["VOL_MA"].replace(0, np.nan)
     df["VOL_YDAY"] = df["Volume"].shift(1)
     m = df["Close"].rolling(bb_window).mean()
